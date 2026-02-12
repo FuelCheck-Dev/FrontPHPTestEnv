@@ -1,0 +1,39 @@
+# Logs
+logs/
+serverlogs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Data & reports
+data/
+reports/
+*.csv
+*.xlsx
+*.pdf
+
+# Images (only transient dirs)
+uploads/
+storage/
+tmp/
+
+# Node
+node_modules/
+dist/
+build/
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Cache
+.cache/
+.tmp/
