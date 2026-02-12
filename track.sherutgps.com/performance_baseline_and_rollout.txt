@@ -1,0 +1,108 @@
+# Performance optimization report (FASE A/B/C quick wins)
+
+## A1) Flujo de carga inicial identificado
+1. tracking.php carga js/bundles/app.core.js y js/bundles/app.bundle.js.
+2. En load2() (app.bundle.js) se dispara en paralelo:
+   - objectLoadData() -> func/fn_objects.php (cmd=load_object_data)
+   - eventsLoadData() -> func/fn_events.php
+   - placesGroupLoadData() -> func/fn_places.php (y luego markers/routes/zones)
+   - dashboard (cuando abre modal) -> func/fn_dashboard.php
+   - historial -> func/fn_history.php
+   - comandos -> func/fn_cmd.php
+
+## A2) Cuellos de botella detectados (evidencia por código)
+- fn_objects.php: patrón N+1 severo:
+  - Consulta objetos del usuario + por cada objeto otra consulta a gs_objects + por cada objeto otra consulta a gs_object_services.
+- fn_history.php: count con SELECT DISTINCT + mysqli_num_rows sobre rango completo, luego segunda query para datos.
+- fn_dashboard.php load_events_data: checkObjectActive() por fila (N+1 lógico).
+- fn_cmd.php listas gprs/sms: doble query completa (count y datos) sin LIMIT efectivo.
+
+## B) Instrumentación agregada
+Frontend:
+- Hook global AJAX en:
+  - js/gs.common.js
+  - js/bundles/app.core.js
+- Métricas capturadas por request: endpoint, cmd, t_request_ms, payload_size, response_size, status, request_id.
+- Logging en consola: [GS_PERF].
+- Beacon opcional: window.gsPerfConfig.beacon_url -> navigator.sendBeacon.
+
+Backend:
+- Helpers comunes agregados en func/fn_common.php:
+  - gsPerfStart(endpoint, cmd)
+  - gsPerfTrackDb(...)
+  - gsPerfFinish(...)
+- Logs JSONL en logs/perf.log con:
+  - request_id, endpoint, cmd, total_time_ms, db_time_ms, rows, payload_size, cache_hit.
+- Endpoint simple para beacon frontend:
+  - func/fn_perf.php -> logs/perf_frontend.log
+
+## C) Optimizaciones implementadas (prioridad alta)
+1) fn_objects.php
+- Eliminado N+1 principal con JOIN gs_user_objects + gs_objects.
+- Servicios cargados en batch (1 query IN (...)) en vez de query por objeto.
+- Nuevo parámetro include_service:
+  - primera carga include_service=1,
+  - refrescos include_service=0 (evita costo repetitivo de servicios).
+- Cálculos de tiempo reutilizando timestamp actual único.
+- Sanitización de IMEI básica.
+
+2) js/gs.main.js y js/bundles/app.bundle.js
+- objectLoadData ahora manda include_service dinámico.
+- Cache de servicios en cliente (objectServiceCacheLoaded).
+- Evita sobreescribir servicios en memoria cuando respuesta incremental no incluye servicios.
+
+3) fn_history.php
+- COUNT(*) para total (evita SELECT DISTINCT + num_rows costoso).
+- LIMIT con hard cap (max 1000 rows por request).
+- Sanitización de ordenamiento (whitelist de columnas + ASC/DESC).
+- Instrumentación de route y msg list.
+
+4) fn_dashboard.php
+- load_events_data usa JOIN a gs_objects active=true, quitando check activo por fila.
+- Instrumentación backend agregada.
+
+5) fn_cmd.php
+- Reemplazo de doble select completo por:
+  - COUNT(*) + query paginada con LIMIT/OFFSET.
+- Límite máximo por request (500 rows).
+- Instrumentación backend agregada.
+
+## Índices SQL recomendados
+Aplicar en ventana controlada:
+
+CREATE INDEX idx_user_objects_user_imei ON gs_user_objects (user_id, imei);
+CREATE INDEX idx_objects_active_imei ON gs_objects (active, imei);
+CREATE INDEX idx_services_imei_name ON gs_object_services (imei, name);
+CREATE INDEX idx_user_last_events_user_dt_imei ON gs_user_last_events_data (user_id, dt_tracker, imei);
+CREATE INDEX idx_cmd_exec_gateway_imei_dt ON gs_object_cmd_exec (gateway, imei, dt_cmd);
+
+Nota historial por tabla dinámica gs_object_data_<imei>:
+ALTER TABLE gs_object_data_<imei> ADD INDEX idx_dt_tracker (dt_tracker);
+ALTER TABLE gs_object_data_<imei> ADD INDEX idx_dt_tracker_server (dt_tracker, dt_server);
+
+## Cómo medir baseline/after (comandos)
+1) Backend p50/p95 por endpoint desde logs/perf.log:
+   jq -r 'select(.endpoint=="fn_objects.php")|.total_time_ms' logs/perf.log | sort -n > /tmp/obj_times.txt
+   (calcular p50/p95 con script local o Python)
+
+2) Frontend p50/p95 desde logs/perf_frontend.log:
+   jq -r '.payload.t_request_ms' logs/perf_frontend.log | sort -n > /tmp/front_times.txt
+
+3) Correlación FE/BE:
+   usar request_id (X-Request-Id) presente en [GS_PERF] y perf.log.
+
+## Feature flags / rollback
+- include_service frontend:
+  - Forzar always 1 en objectLoadData para rollback inmediato sin tocar backend.
+- Instrumentación:
+  - Si se requiere apagar, comentar gsPerfFinish(...) en endpoints (no afecta lógica funcional).
+- Endpoint beacon:
+  - Opcional; no usado si window.gsPerfConfig.beacon_url no está definido.
+
+## Checklist despliegue seguro
+1. Deploy código.
+2. Ejecutar índices en horas de baja carga.
+3. Validar login/tracking/history/dashboard/cmd manualmente.
+4. Revisar logs/perf.log por 30-60 min.
+5. Comparar p95 antes/después.
+6. Si hay regresión, rollback include_service o endpoint específico.
